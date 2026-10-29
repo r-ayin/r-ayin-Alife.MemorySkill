@@ -167,6 +167,12 @@ public class MemorySkillService(
   python memory.py search "查询" [--k 5] [--root PATH]
   python memory.py read <id> [--root PATH]
   python memory.py stats [--root PATH]
+  python memory.py annotate <id> "批注文字"        # 给某条存档挂批注
+  python memory.py supersede <id> --by <新id> [--reason 原因]   # 登记「该结论已被推翻/更新」
+  python memory.py notes <id>                      # 查看一条存档的修订账本
+
+修订账本：批注与推翻关系记在索引库 mem_note 表里，绝不改角色存档原文。
+被标记的存档每次在 search/read 中被调出时，警告自动随行显示。
 """
 import argparse, json, math, os, re, sqlite3, struct, sys, urllib.request
 from datetime import datetime
@@ -206,6 +212,10 @@ CREATE INDEX IF NOT EXISTS idx_mem_time  ON memories(end_at);
 CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(
   id UNINDEXED, level UNINDEXED, body, tokenize='trigram');
 CREATE TABLE IF NOT EXISTS mem_vec(mem_id TEXT PRIMARY KEY, dim INTEGER, vec BLOB);
+CREATE TABLE IF NOT EXISTS mem_note(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  mem_id TEXT, kind TEXT, note TEXT, ref_id TEXT, created_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_note_mem ON mem_note(mem_id);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -303,29 +313,36 @@ def do_index(args):
         con.executescript(SCHEMA)
         con.commit()
     files = scan_files(root)
-    known = {r[0] for r in con.execute("SELECT id FROM memories")}
-    added = 0
+    known = {r[0]: r[1] for r in con.execute("SELECT id, size FROM memories")}
+    added = updated = 0
     for level, start_at, end_at, path, mid in files:
-        if mid in known:
-            continue
         try:
             body = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        size = len(body.encode("utf-8"))
+        if mid in known and known[mid] == size:
+            continue                      # 未变化，跳过
+        is_update = mid in known
         con.execute(
             "INSERT OR REPLACE INTO memories VALUES(?,?,?,?,?,?,?,?)",
-            (mid, level, start_at, end_at, body, str(path), len(body.encode("utf-8")),
+            (mid, level, start_at, end_at, body, str(path), size,
              datetime.now().isoformat(timespec="seconds")))
         con.execute("DELETE FROM mem_fts WHERE id=?", (mid,))
         con.execute("INSERT INTO mem_fts(id, level, body) VALUES(?,?,?)", (mid, level, body))
-        added += 1
+        con.execute("DELETE FROM mem_vec WHERE mem_id=?", (mid,))   # 正文变了，旧向量作废
+        if is_update:
+            updated += 1
+        else:
+            added += 1
     con.commit()
     vec_done = 0
     if args.vec:
         vec_done = build_vectors(con)
     total = con.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
     print(json.dumps({"root": str(root), "scanned": len(files), "added": added,
-                      "vectors_built": vec_done, "total": total}, ensure_ascii=False))
+                      "updated": updated, "vectors_built": vec_done, "total": total},
+                     ensure_ascii=False))
 
 
 def embed(text, timeout=8, kind="document"):
@@ -479,6 +496,14 @@ def do_search(args):
         })
     out.sort(key=lambda x: -x["score"])
     out = out[:args.k]
+    for x in out:
+        warns, notes, supersedes = ledger_for(con, x["id"])
+        if warns:
+            x["warn"] = "⚠ 已过期：" + "；".join(warns)
+        if supersedes:
+            x["supersedes"] = supersedes
+        if notes:
+            x["notes"] = notes
     if len(out) > 1:
         hi, lo = out[0]["score"], out[-1]["score"]
         span = hi - lo
@@ -489,12 +514,75 @@ def do_search(args):
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+def ledger_for(con, mid):
+    """一条存档的修订账本：(推翻警告, 批注, 本条推翻了谁)。"""
+    rows = con.execute(
+        "SELECT kind, note, ref_id, created_at FROM mem_note WHERE mem_id=? ORDER BY seq",
+        (mid,)).fetchall()
+    back = con.execute(
+        "SELECT mem_id, created_at FROM mem_note WHERE ref_id=? AND kind='supersede' ORDER BY seq",
+        (mid,)).fetchall()
+    warns = [f"已被 {r['ref_id']} 推翻/更新（{r['created_at'][:10]}）"
+             + (f"：{r['note']}" if r["note"] else "")
+             for r in rows if r["kind"] == "supersede"]
+    notes = [f"（{r['created_at'][:10]}）{r['note']}" for r in rows if r["kind"] == "note"]
+    supersedes = [f"{r['mem_id']}（{r['created_at'][:10]}）" for r in back]
+    return warns, notes, supersedes
+
+
+def do_annotate(args):
+    con = connect_db(args.db)
+    if not con.execute("SELECT 1 FROM memories WHERE id=?", (args.id,)).fetchone():
+        print(f"未找到 {args.id}", file=sys.stderr)
+        sys.exit(2)
+    con.execute("INSERT INTO mem_note(mem_id, kind, note, ref_id, created_at) VALUES(?,?,?,?,?)",
+                (args.id, "note", args.text, None,
+                 datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    print(json.dumps({"annotated": args.id, "note": args.text}, ensure_ascii=False))
+
+
+def do_supersede(args):
+    con = connect_db(args.db)
+    if not con.execute("SELECT 1 FROM memories WHERE id=?", (args.id,)).fetchone():
+        print(f"未找到 {args.id}", file=sys.stderr)
+        sys.exit(2)
+    if not con.execute("SELECT 1 FROM memories WHERE id=?", (args.by,)).fetchone():
+        print(f"[warn] {args.by} 尚不在索引中（先跑 index 收录它）；关系照记", file=sys.stderr)
+    con.execute("INSERT INTO mem_note(mem_id, kind, note, ref_id, created_at) VALUES(?,?,?,?,?)",
+                (args.id, "supersede", args.reason or "", args.by,
+                 datetime.now().isoformat(timespec="seconds")))
+    con.commit()
+    print(json.dumps({"superseded": args.id, "by": args.by,
+                      "reason": args.reason or ""}, ensure_ascii=False))
+
+
+def do_notes(args):
+    con = connect_db(args.db)
+    warns, notes, supersedes = ledger_for(con, args.id)
+    print(json.dumps({"id": args.id, "warns": warns, "notes": notes,
+                      "supersedes": supersedes}, ensure_ascii=False, indent=2))
+
+
 def do_read(args):
     con = connect_db(args.db)
     row = con.execute("SELECT body, file FROM memories WHERE id=?", (args.id,)).fetchone()
     if row is None:
         print(f"未找到 {args.id}", file=sys.stderr)
         sys.exit(2)
+    warns, notes, supersedes = ledger_for(con, args.id)
+    if warns:
+        print("⚠⚠ 修订警告：本条结论已过期，引用前必看 ⚠⚠")
+        for w in warns:
+            print("  - " + w)
+    if supersedes:
+        print("ℹ 本条推翻/更新了：" + "、".join(supersedes))
+    if notes:
+        print("批注：")
+        for n in notes:
+            print("  - " + n)
+    if warns or notes or supersedes:
+        print("-" * 46)
     print(row["body"])
 
 
@@ -574,6 +662,9 @@ def main():
     p = sub.add_parser("stats"); p.add_argument("--db")
     p = sub.add_parser("audit"); p.add_argument("--db")
     p = sub.add_parser("drop"); p.add_argument("id"); p.add_argument("--db")
+    p = sub.add_parser("annotate"); p.add_argument("id"); p.add_argument("text"); p.add_argument("--db")
+    p = sub.add_parser("supersede"); p.add_argument("id"); p.add_argument("--by", required=True); p.add_argument("--reason"); p.add_argument("--db")
+    p = sub.add_parser("notes"); p.add_argument("id"); p.add_argument("--db")
     args = ap.parse_args()
     if args.cmd == "root":
         print(resolve_root(None))
@@ -589,6 +680,12 @@ def main():
         do_audit(args)
     elif args.cmd == "drop":
         do_drop(args)
+    elif args.cmd == "annotate":
+        do_annotate(args)
+    elif args.cmd == "supersede":
+        do_supersede(args)
+    elif args.cmd == "notes":
+        do_notes(args)
 
 
 if __name__ == "__main__":
@@ -679,8 +776,32 @@ python memory.py drop <id>
 
 这条命令**只删索引里的条目**，不动磁盘上的 .txt 原档。要彻底删对话记忆，用 Alife 自带的 `Forget`。
 
+### 5. 修订账本（防止过期结论冒充现行）
+
+存档是快照，不会自我覆盖：一条 L8 结论后来被推翻，原文永远停在旧版本。
+账本机制把「推翻关系」记在索引库里（**绝不改存档原文**），被标记的条目每次
+在 search/read 中被调出时，警告自动随行：
+
+```bash
+# 结论被新档推翻时登记（旧档 id + 新档 id + 原因）
+python memory.py supersede <旧id> --by <新id> --reason "哪里被推翻了"
+
+# 给任何一条挂普通批注（补充语境、提醒别当结论用）
+python memory.py annotate <id> "批注文字"
+
+# 查一条的完整账本
+python memory.py notes <id>
+```
+
+效果：search 结果里该条目多出 `warn` 字段（⚠ 已过期：已被 xxx 推翻/更新）；
+read 正文前印醒目警告头；新档一侧自动显示「本条推翻了哪些旧档」（反向链接）。
+
+**纪律：发现自己引用过的结论被新证据推翻时，当场 supersede，别指望下次记得。**
+另外 index 现在会检测存档正文变化（角色自己改过文件的情况），重跑即刷新索引与向量。
+
 ## 判断召回结果好不好的三条
 
+0. 有 `warn` 字段的条目：**结论已过期**，先看推翻它的新档再决定引不引用
 1. `sources` 只有 `fts`：只是字面命中，**语义可能不准**，要谨慎引用
 2. `rel` 第一名 1.0、第二名 ≤0.3：第一名可信；如果都是 1.0/0.9/0.8 挤在一起，说明几条都差不多相关，要读 snippet 分辨
 3. 前五名 `level` 全是 7-8（最粗层）：只有高层摘要相关，细节要靠 `read` 展开
